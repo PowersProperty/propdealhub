@@ -1,0 +1,9 @@
+node_modules
+.manus-logs
+dist
+.env
+*.bak
+context_docs
+acquisition_doc.txt
+acquisition_master.docx
+todo.md

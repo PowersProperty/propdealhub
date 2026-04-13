@@ -1,4 +1,4 @@
-import { eq, desc, asc, like, or, and } from "drizzle-orm";
+import { eq, desc, asc, like, or, and, isNotNull } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/mysql2";
 import {
   InsertUser, users,
@@ -6,6 +6,7 @@ import {
   outreachLog, InsertOutreachLog, OutreachLog,
 } from "../drizzle/schema";
 import { ENV } from './_core/env';
+import { scoreLead, computeDaysToAuction, type LeadType } from "./scoring";
 
 let _db: ReturnType<typeof drizzle> | null = null;
 
@@ -150,10 +151,119 @@ export type UpdateLeadData = Partial<Pick<Lead,
   | "walkthroughData"
 >>;
 
+/**
+ * Fields that, when changed, should trigger a score recalculation.
+ * If any of these change, we rescore after the update.
+ */
+const SCORE_AFFECTING_FIELDS: Array<keyof UpdateLeadData> = [
+  "ownerPhone",
+  "ownerEmail",
+  "ownerMailingAddress",
+  "skipTraceStatus",
+  "estimatedValue",
+  "mortgageBalance",
+  "auctionDate",
+  "pipelineStage",
+];
+
 export async function updateLead(id: number, data: UpdateLeadData): Promise<void> {
   const db = await getDb();
   if (!db) throw new Error("Database not available");
+
+  // Check if any score-affecting field is changing
+  const affectsScore = Object.keys(data).some(k =>
+    SCORE_AFFECTING_FIELDS.includes(k as keyof UpdateLeadData)
+  );
+
+  // Recompute daysToAuction if auctionDate changed
+  if (data.auctionDate !== undefined) {
+    (data as any).daysToAuction = computeDaysToAuction(
+      data.auctionDate ? new Date(data.auctionDate as any) : null
+    );
+  }
+
   await db.update(leads).set(data).where(eq(leads.id, id));
+
+  // Rescore if needed
+  if (affectsScore) {
+    await rescoreLead(id);
+  }
+}
+
+/**
+ * Recalculate and persist the score for a single lead.
+ * Called automatically on updates to score-affecting fields.
+ */
+export async function rescoreLead(leadId: number): Promise<void> {
+  const db = await getDb();
+  if (!db) return;
+  const [lead] = await db.select().from(leads).where(eq(leads.id, leadId)).limit(1);
+  if (!lead) return;
+
+  const daysToAuction = computeDaysToAuction(lead.auctionDate);
+  const score = scoreLead({
+    leadType: lead.leadType as LeadType,
+    distressFlags: lead.distressFlags,
+    equity: lead.equity ? parseFloat(lead.equity) : null,
+    price: lead.price,
+    estimatedValue: lead.estimatedValue,
+    mortgageBalance: lead.mortgageBalance,
+    auctionDate: lead.auctionDate,
+    daysToAuction,
+    createdAt: lead.createdAt,
+    pipelineStage: lead.pipelineStage,
+    skipTraceStatus: lead.skipTraceStatus,
+    ownerPhone: lead.ownerPhone,
+    ownerEmail: lead.ownerEmail,
+    ownerMailingAddress: lead.ownerMailingAddress,
+  });
+
+  await db.update(leads).set({
+    dealScore: score.dealScore,
+    motivationScore: score.motivationScore,
+    economicsScore: score.economicsScore,
+    urgencyScore: score.urgencyScore,
+    reachabilityScore: score.reachabilityScore,
+    isUrgent: score.isUrgent,
+    daysToAuction,
+    lastScoredAt: new Date(),
+  }).where(eq(leads.id, leadId));
+
+  console.log(`[Rescore] Lead ${leadId}: ${score.dealScore}/10 (M:${score.motivationScore} E:${score.economicsScore} U:${score.urgencyScore} R:${score.reachabilityScore})`);
+}
+
+/**
+ * Recalculate scores for ALL leads. Intended to be called by a daily cron.
+ * Handles time-based decay: daysToAuction countdown, lead age penalty.
+ */
+export async function rescoreAllLeads(): Promise<{ total: number; updated: number; errors: number }> {
+  const db = await getDb();
+  if (!db) return { total: 0, updated: 0, errors: 0 };
+
+  const allLeads = await db.select().from(leads).where(
+    // Skip dead/closed leads — no point rescoring terminal states
+    or(
+      eq(leads.pipelineStage, "new_lead"),
+      eq(leads.pipelineStage, "contacted"),
+      eq(leads.pipelineStage, "conversation_started"),
+      eq(leads.pipelineStage, "appointment_scheduled"),
+    )!
+  );
+
+  let updated = 0;
+  let errors = 0;
+
+  for (const lead of allLeads) {
+    try {
+      await rescoreLead(lead.id);
+      updated++;
+    } catch (err) {
+      console.error(`[Rescore] Failed for lead ${lead.id}:`, err);
+      errors++;
+    }
+  }
+
+  return { total: allLeads.length, updated, errors };
 }
 
 export async function deleteLead(id: number): Promise<void> {

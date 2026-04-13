@@ -48,7 +48,7 @@ export const leads = mysqlTable("leads", {
   leadType: mysqlEnum("leadType", ["preforeclosure", "absentee", "vacant", "taxdelinquent", "otc_tax_lien", "pricedrop"]).notNull(),
   source: varchar("source", { length: 100 }).notNull().default("Propwire"),
 
-  // Pipeline stage (expanded from original 4-status)
+  // Pipeline stage
   pipelineStage: mysqlEnum("pipelineStage", [
     "new_lead",
     "contacted",
@@ -61,11 +61,18 @@ export const leads = mysqlTable("leads", {
     "dead",
   ]).default("new_lead").notNull(),
 
-  // Deal intelligence
-  dealScore: float("dealScore"),          // 0.0 – 10.0, auto-calculated on ingest
-  isUrgent: boolean("isUrgent").default(false).notNull(), // equity > $40k OR auction < 30 days
-  auctionDate: timestamp("auctionDate"),  // for pre-foreclosures
-  daysToAuction: int("daysToAuction"),    // computed on ingest
+  // Deal intelligence (enhanced scoring system — Phase 1)
+  dealScore: float("dealScore"),                   // 0.0 – 10.0, normalized from totalRaw/10
+  motivationScore: float("motivationScore"),       // 0-30 raw dimension score
+  economicsScore: float("economicsScore"),         // 0-30 raw dimension score
+  urgencyScore: float("urgencyScore"),             // 0-20 raw dimension score
+  reachabilityScore: float("reachabilityScore"),   // 0-20 raw dimension score
+  lastScoredAt: timestamp("lastScoredAt"),         // when score was last recalculated
+  distressFlags: varchar("distressFlags", { length: 255 }), // comma-separated: "vacant,taxdelinquent"
+
+  isUrgent: boolean("isUrgent").default(false).notNull(),
+  auctionDate: timestamp("auctionDate"),
+  daysToAuction: int("daysToAuction"),
 
   // Owner info (from skip trace)
   ownerName: varchar("ownerName", { length: 255 }),
@@ -77,7 +84,7 @@ export const leads = mysqlTable("leads", {
   // Notes and raw data
   notes: text("notes"),
   rawData: text("rawData"),
-  walkthroughData: text("walkthroughData"), // JSON: { items: WalkthroughItem[], redFlagCount, decision, savedAt }
+  walkthroughData: text("walkthroughData"),
 
   createdAt: timestamp("createdAt").defaultNow().notNull(),
   updatedAt: timestamp("updatedAt").defaultNow().onUpdateNow().notNull(),
@@ -86,7 +93,7 @@ export const leads = mysqlTable("leads", {
 export type Lead = typeof leads.$inferSelect;
 export type InsertLead = typeof leads.$inferInsert;
 
-// ─── Outreach Log ──────────────────────────────────────────────────────────────
+// ─── Outreach Log ─────────────────────────────────────────────────────────────
 export const outreachLog = mysqlTable("outreach_log", {
   id: int("id").autoincrement().primaryKey(),
   leadId: int("leadId").notNull(),

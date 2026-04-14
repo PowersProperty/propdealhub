@@ -3,8 +3,14 @@ import { systemRouter } from "./_core/systemRouter";
 import { publicProcedure, protectedProcedure, router } from "./_core/trpc";
 import { TRPCError } from "@trpc/server";
 import {
-  getAllLeads, getLeadById, updateLead, deleteLead,
-  insertOutreach, getOutreachByLead,
+  getAllLeads,
+  getLeadById,
+  updateLead,
+  deleteLead,
+  insertOutreach,
+  getOutreachByLead,
+  rescoreLead,
+  rescoreAllLeads,
 } from "./db";
 import type { Lead } from "../drizzle/schema";
 
@@ -56,9 +62,8 @@ export const appRouter = router({
       .input(z.object({
         id: z.number(),
         pipelineStage: z.enum([
-          "new_lead", "contacted", "conversation_started",
-          "appointment_scheduled", "property_visit",
-          "offer_sent", "under_contract", "closed", "dead",
+          "new_lead", "contacted", "conversation_started", "appointment_scheduled",
+          "property_visit", "offer_sent", "under_contract", "closed", "dead",
         ]).optional(),
         notes: z.string().optional(),
         ownerName: z.string().optional(),
@@ -81,6 +86,23 @@ export const appRouter = router({
       .mutation(async ({ input }) => {
         await deleteLead(input.id);
         return { success: true };
+      }),
+
+    // ── Scoring (Phase 1) ──────────────────────────────────────────────────
+    // Manual recompute of a single lead's score — call from UI "Re-score" button
+    rescore: protectedProcedure
+      .input(z.object({ id: z.number() }))
+      .mutation(async ({ input }) => {
+        await rescoreLead(input.id);
+        return { success: true };
+      }),
+
+    // Recompute ALL active leads. Normally called by daily cron, but exposed here
+    // for manual triggers from the dashboard / admin UI.
+    rescoreAll: protectedProcedure
+      .mutation(async () => {
+        const result = await rescoreAllLeads();
+        return result;
       }),
 
     // Outreach log

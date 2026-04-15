@@ -11,6 +11,17 @@ import { serveStatic, setupVite } from "./vite";
 import { insertLead, rescoreAllLeads } from "../db";
 import { sendTelegramAlert } from "../telegram";
 import { scoreLead, computeDaysToAuction, deriveDistressFlags, type LeadType } from "../scoring";
+import { runPreset, runPullJob, FILTER_PRESETS } from "../batchdata";
+import {
+  buildAuthorizeUrl, exchangeCodeForTokens, storeTokens, testGmailConnection
+} from "../gmail-sender";
+import {
+  resolveUnsubscribeToken, addToSuppressionList
+} from "../compliance";
+import {
+  qualifyAll, qualifyLead, tick, listReviewQueue,
+  approveQueueItem, rejectQueueItem, editQueueItem
+} from "../sequencer";
 
 const APP_UNLOCK_COOKIE = "pdh_unlocked";
 
@@ -283,6 +294,239 @@ async function startServer() {
       return res.status(500).json({ error: "Internal server error" });
     }
   });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Phase 2: Helper — admin auth via webhook secret
+  // ═══════════════════════════════════════════════════════════════════════
+  const requireAdmin = (req: any, res: any, next: () => void) => {
+    const secret = req.headers["x-admin-secret"] || req.query?.secret;
+    const expected = process.env.WEBHOOK_SECRET ?? "propstream2026";
+    if (secret !== expected) {
+      return res.status(401).json({ error: "Unauthorized" });
+    }
+    next();
+  };
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Phase 2: BatchData ingestion endpoints
+  // ═══════════════════════════════════════════════════════════════════════
+  app.post("/api/batchdata/pull/:preset", (req, res) =>
+    requireAdmin(req, res, async () => {
+      try {
+        const presetName = req.params.preset;
+        if (!(presetName in FILTER_PRESETS)) {
+          return res.status(400).json({
+            error: `Unknown preset. Available: ${Object.keys(FILTER_PRESETS).join(", ")}`,
+          });
+        }
+        const result = await runPreset(presetName as any);
+        return res.json(result);
+      } catch (e: any) {
+        console.error("[BatchData] pull error:", e);
+        return res.status(500).json({ error: String(e?.message ?? e) });
+      }
+    })
+  );
+
+  app.post("/api/batchdata/pull", (req, res) =>
+    requireAdmin(req, res, async () => {
+      try {
+        const { filterName, criteria, options } = req.body ?? {};
+        if (!filterName || !criteria) {
+          return res.status(400).json({ error: "filterName and criteria required" });
+        }
+        const result = await runPullJob(filterName, criteria, options ?? {});
+        return res.json(result);
+      } catch (e: any) {
+        console.error("[BatchData] custom pull error:", e);
+        return res.status(500).json({ error: String(e?.message ?? e) });
+      }
+    })
+  );
+
+  app.get("/api/batchdata/presets", (_req, res) => {
+    res.json({ presets: Object.keys(FILTER_PRESETS), details: FILTER_PRESETS });
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Phase 2: Gmail OAuth flow
+  // ═══════════════════════════════════════════════════════════════════════
+  app.get("/api/auth/gmail/authorize", (req, res) => {
+    try {
+      const url = buildAuthorizeUrl(String(req.query?.state ?? ""));
+      res.redirect(url);
+    } catch (e: any) {
+      res.status(500).send(`OAuth setup error: ${e?.message ?? e}`);
+    }
+  });
+
+  app.get("/api/auth/gmail/callback", async (req, res) => {
+    try {
+      const code = String(req.query?.code ?? "");
+      if (!code) return res.status(400).send("Missing code");
+      const tokens = await exchangeCodeForTokens(code);
+      await storeTokens({
+        gmailAddress: tokens.gmailAddress,
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token,
+        expiresIn: tokens.expires_in,
+        scope: tokens.scope,
+      });
+      res.send(`
+        <html><body style="font-family:sans-serif;padding:40px;max-width:600px;margin:0 auto;">
+        <h2>Gmail connected</h2>
+        <p>Connected as: <strong>${tokens.gmailAddress}</strong></p>
+        <p>You can close this tab. Outreach sends will now work.</p>
+        </body></html>
+      `);
+    } catch (e: any) {
+      console.error("[Gmail OAuth] callback error:", e);
+      res.status(500).send(`OAuth callback error: ${e?.message ?? e}`);
+    }
+  });
+
+  app.get("/api/auth/gmail/test", (req, res) =>
+    requireAdmin(req, res, async () => {
+      const r = await testGmailConnection();
+      res.json(r);
+    })
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Phase 2: Unsubscribe (public — no auth)
+  // ═══════════════════════════════════════════════════════════════════════
+  app.get("/api/unsubscribe/:token", async (req, res) => {
+    try {
+      const resolved = await resolveUnsubscribeToken(req.params.token);
+      if (!resolved) {
+        return res
+          .status(404)
+          .send("<html><body>This unsubscribe link is no longer valid.</body></html>");
+      }
+      if (resolved.contact) {
+        await addToSuppressionList(resolved.contact, resolved.type, "unsubscribed", {
+          sourceLeadId: resolved.leadId ?? undefined,
+          notes: "Clicked unsubscribe link",
+        });
+      }
+      res.send(`
+        <html><body style="font-family:sans-serif;padding:40px;max-width:600px;margin:0 auto;">
+        <h2>You've been unsubscribed</h2>
+        <p>You won't receive any further emails from us. We've removed ${resolved.contact} from our list.</p>
+        </body></html>
+      `);
+    } catch (e: any) {
+      console.error("[Unsubscribe] error:", e);
+      res.status(500).send("Unsubscribe failed. Please email us directly to opt out.");
+    }
+  });
+
+  app.post("/api/unsubscribe/:token", async (req, res) => {
+    try {
+      const resolved = await resolveUnsubscribeToken(req.params.token);
+      if (!resolved) return res.status(404).send("Invalid token");
+      if (resolved.contact) {
+        await addToSuppressionList(resolved.contact, resolved.type, "unsubscribed", {
+          sourceLeadId: resolved.leadId ?? undefined,
+        });
+      }
+      res.status(200).send("OK");
+    } catch (e: any) {
+      res.status(500).send(String(e?.message ?? e));
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // Phase 2: Outreach queue + tick
+  // ═══════════════════════════════════════════════════════════════════════
+  app.post("/api/outreach/qualify/:leadId", (req, res) =>
+    requireAdmin(req, res, async () => {
+      try {
+        const leadId = parseInt(req.params.leadId, 10);
+        const r = await qualifyLead(leadId);
+        res.json(r);
+      } catch (e: any) {
+        res.status(500).json({ error: String(e?.message ?? e) });
+      }
+    })
+  );
+
+  app.post("/api/outreach/qualify-all", (req, res) =>
+    requireAdmin(req, res, async () => {
+      try {
+        const r = await qualifyAll();
+        res.json(r);
+      } catch (e: any) {
+        res.status(500).json({ error: String(e?.message ?? e) });
+      }
+    })
+  );
+
+  app.post("/api/outreach/tick", (req, res) =>
+    requireAdmin(req, res, async () => {
+      try {
+        const limit = parseInt(String(req.query?.limit ?? "50"), 10);
+        const r = await tick(limit);
+        res.json(r);
+      } catch (e: any) {
+        res.status(500).json({ error: String(e?.message ?? e) });
+      }
+    })
+  );
+
+  app.get("/api/outreach/queue", (req, res) =>
+    requireAdmin(req, res, async () => {
+      try {
+        const limit = parseInt(String(req.query?.limit ?? "50"), 10);
+        const rows = await listReviewQueue(limit);
+        res.json({ items: rows, count: rows.length });
+      } catch (e: any) {
+        res.status(500).json({ error: String(e?.message ?? e) });
+      }
+    })
+  );
+
+  app.post("/api/outreach/queue/:id/approve", (req, res) =>
+    requireAdmin(req, res, async () => {
+      try {
+        const id = parseInt(req.params.id, 10);
+        const reviewer = String(req.body?.reviewer ?? "chris");
+        await approveQueueItem(id, reviewer);
+        res.json({ success: true });
+      } catch (e: any) {
+        res.status(500).json({ error: String(e?.message ?? e) });
+      }
+    })
+  );
+
+  app.post("/api/outreach/queue/:id/reject", (req, res) =>
+    requireAdmin(req, res, async () => {
+      try {
+        const id = parseInt(req.params.id, 10);
+        const reviewer = String(req.body?.reviewer ?? "chris");
+        const reason = req.body?.reason ? String(req.body.reason) : undefined;
+        await rejectQueueItem(id, reviewer, reason);
+        res.json({ success: true });
+      } catch (e: any) {
+        res.status(500).json({ error: String(e?.message ?? e) });
+      }
+    })
+  );
+
+  app.patch("/api/outreach/queue/:id", (req, res) =>
+    requireAdmin(req, res, async () => {
+      try {
+        const id = parseInt(req.params.id, 10);
+        await editQueueItem(id, {
+          subject: req.body?.subject,
+          renderedBody: req.body?.renderedBody,
+        });
+        res.json({ success: true });
+      } catch (e: any) {
+        res.status(500).json({ error: String(e?.message ?? e) });
+      }
+    })
+  );
 
   // ── tRPC ─────────────────────────────────────────────────────────────────
   app.use(

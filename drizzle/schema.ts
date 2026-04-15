@@ -8,6 +8,8 @@ import {
   decimal,
   boolean,
   float,
+  uniqueIndex,
+  index,
 } from "drizzle-orm/mysql-core";
 
 // ─── Users (kept for template compatibility, not used in password-gate mode) ───
@@ -106,3 +108,105 @@ export const outreachLog = mysqlTable("outreach_log", {
 
 export type OutreachLog = typeof outreachLog.$inferSelect;
 export type InsertOutreachLog = typeof outreachLog.$inferInsert;
+
+// ════════════════════════════════════════════════════════════════════════════
+// Phase 2: Outreach automation
+// ════════════════════════════════════════════════════════════════════════════
+
+// ─── Suppression List ──────────────────────────────────────────────────────
+export const suppressionList = mysqlTable(
+  "suppression_list",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    contact: varchar("contact", { length: 320 }).notNull(),
+    contactType: mysqlEnum("contact_type", ["email", "phone"]).notNull(),
+    reason: mysqlEnum("reason", [
+      "unsubscribed",
+      "bounced",
+      "complained",
+      "manual",
+      "dnc_list",
+      "litigator",
+    ]).notNull(),
+    sourceLeadId: int("source_lead_id"),
+    notes: text("notes"),
+    suppressedAt: timestamp("suppressed_at").defaultNow().notNull(),
+  },
+  (t) => ({
+    uqContact: uniqueIndex("uq_contact").on(t.contact, t.contactType),
+    idxContact: index("idx_contact_lookup").on(t.contact),
+  })
+);
+
+export type SuppressionEntry = typeof suppressionList.$inferSelect;
+export type InsertSuppressionEntry = typeof suppressionList.$inferInsert;
+
+// ─── Gmail OAuth Tokens ────────────────────────────────────────────────────
+export const gmailTokens = mysqlTable("gmail_tokens", {
+  id: int("id").autoincrement().primaryKey(),
+  gmailAddress: varchar("gmail_address", { length: 320 }).notNull().unique(),
+  accessToken: text("access_token").notNull(),
+  refreshToken: text("refresh_token").notNull(),
+  expiresAt: timestamp("expires_at").notNull(),
+  scope: text("scope").notNull(),
+  createdAt: timestamp("created_at").defaultNow().notNull(),
+  updatedAt: timestamp("updated_at").defaultNow().onUpdateNow().notNull(),
+});
+
+export type GmailToken = typeof gmailTokens.$inferSelect;
+export type InsertGmailToken = typeof gmailTokens.$inferInsert;
+
+// ─── Outreach Review Queue ─────────────────────────────────────────────────
+export const outreachQueue = mysqlTable(
+  "outreach_queue",
+  {
+    id: int("id").autoincrement().primaryKey(),
+    leadId: int("lead_id").notNull(),
+    channel: mysqlEnum("channel", ["email", "sms"]).notNull(),
+    templateId: varchar("template_id", { length: 64 }).notNull(),
+    subject: varchar("subject", { length: 500 }),
+    renderedBody: text("rendered_body").notNull(),
+    tier: mysqlEnum("tier", ["auto", "review"]).notNull(),
+    status: mysqlEnum("status", [
+      "pending",
+      "approved",
+      "rejected",
+      "sent",
+      "failed",
+      "skipped_suppressed",
+    ])
+      .default("pending")
+      .notNull(),
+    scheduledFor: timestamp("scheduled_for"),
+    reviewedBy: varchar("reviewed_by", { length: 320 }),
+    reviewedAt: timestamp("reviewed_at"),
+    sentAt: timestamp("sent_at"),
+    unsubscribeToken: varchar("unsubscribe_token", { length: 128 }),
+    failureReason: text("failure_reason"),
+    createdAt: timestamp("created_at").defaultNow().notNull(),
+  },
+  (t) => ({
+    idxStatus: index("idx_status_scheduled").on(t.status, t.scheduledFor),
+    idxLead: index("idx_lead").on(t.leadId),
+  })
+);
+
+export type OutreachQueueItem = typeof outreachQueue.$inferSelect;
+export type InsertOutreachQueueItem = typeof outreachQueue.$inferInsert;
+
+// ─── BatchData Pull Log ────────────────────────────────────────────────────
+export const batchdataPulls = mysqlTable("batchdata_pulls", {
+  id: int("id").autoincrement().primaryKey(),
+  pulledAt: timestamp("pulled_at").defaultNow().notNull(),
+  filterName: varchar("filter_name", { length: 100 }).notNull(),
+  searchCriteria: text("search_criteria").notNull(),
+  totalResults: int("total_results").default(0).notNull(),
+  newLeadsCreated: int("new_leads_created").default(0).notNull(),
+  duplicatesSkipped: int("duplicates_skipped").default(0).notNull(),
+  skipTraceMatches: int("skip_trace_matches").default(0).notNull(),
+  costCents: int("cost_cents").default(0).notNull(),
+  error: text("error"),
+});
+
+export type BatchdataPull = typeof batchdataPulls.$inferSelect;
+export type InsertBatchdataPull = typeof batchdataPulls.$inferInsert;

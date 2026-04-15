@@ -296,6 +296,109 @@ async function startServer() {
   });
 
   // ═══════════════════════════════════════════════════════════════════════
+  // Phase 2: One-shot migration bootstrap (safe to re-run — uses IF NOT EXISTS)
+  // ═══════════════════════════════════════════════════════════════════════
+  app.post("/api/admin/bootstrap-phase2-migration", async (req, res) => {
+    try {
+      const secret = req.headers["x-admin-secret"] || req.query?.secret;
+      const expected = process.env.WEBHOOK_SECRET ?? "propstream2026";
+      if (secret !== expected) return res.status(401).json({ error: "Unauthorized" });
+
+      const { getDb } = await import("../db");
+      const { sql } = await import("drizzle-orm");
+      const db = await getDb();
+      if (!db) return res.status(500).json({ error: "DB unavailable" });
+
+      const results: any[] = [];
+      const statements = [
+        `CREATE TABLE IF NOT EXISTS \`suppression_list\` (
+          \`id\` INT AUTO_INCREMENT PRIMARY KEY,
+          \`contact\` VARCHAR(320) NOT NULL,
+          \`contact_type\` ENUM('email','phone') NOT NULL,
+          \`reason\` ENUM('unsubscribed','bounced','complained','manual','dnc_list','litigator') NOT NULL,
+          \`source_lead_id\` INT NULL,
+          \`notes\` TEXT NULL,
+          \`suppressed_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          UNIQUE KEY \`uq_contact\` (\`contact\`, \`contact_type\`),
+          INDEX \`idx_contact_lookup\` (\`contact\`)
+        )`,
+        `CREATE TABLE IF NOT EXISTS \`gmail_tokens\` (
+          \`id\` INT AUTO_INCREMENT PRIMARY KEY,
+          \`gmail_address\` VARCHAR(320) NOT NULL UNIQUE,
+          \`access_token\` TEXT NOT NULL,
+          \`refresh_token\` TEXT NOT NULL,
+          \`expires_at\` TIMESTAMP NOT NULL,
+          \`scope\` TEXT NOT NULL,
+          \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          \`updated_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        )`,
+        `CREATE TABLE IF NOT EXISTS \`outreach_queue\` (
+          \`id\` INT AUTO_INCREMENT PRIMARY KEY,
+          \`lead_id\` INT NOT NULL,
+          \`channel\` ENUM('email','sms') NOT NULL,
+          \`template_id\` VARCHAR(64) NOT NULL,
+          \`subject\` VARCHAR(500) NULL,
+          \`rendered_body\` TEXT NOT NULL,
+          \`tier\` ENUM('auto','review') NOT NULL,
+          \`status\` ENUM('pending','approved','rejected','sent','failed','skipped_suppressed') NOT NULL DEFAULT 'pending',
+          \`scheduled_for\` TIMESTAMP NULL,
+          \`reviewed_by\` VARCHAR(320) NULL,
+          \`reviewed_at\` TIMESTAMP NULL,
+          \`sent_at\` TIMESTAMP NULL,
+          \`unsubscribe_token\` VARCHAR(128) NULL,
+          \`failure_reason\` TEXT NULL,
+          \`created_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          INDEX \`idx_status_scheduled\` (\`status\`, \`scheduled_for\`),
+          INDEX \`idx_lead\` (\`lead_id\`)
+        )`,
+        `CREATE TABLE IF NOT EXISTS \`batchdata_pulls\` (
+          \`id\` INT AUTO_INCREMENT PRIMARY KEY,
+          \`pulled_at\` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          \`filter_name\` VARCHAR(100) NOT NULL,
+          \`search_criteria\` TEXT NOT NULL,
+          \`total_results\` INT NOT NULL DEFAULT 0,
+          \`new_leads_created\` INT NOT NULL DEFAULT 0,
+          \`duplicates_skipped\` INT NOT NULL DEFAULT 0,
+          \`skip_trace_matches\` INT NOT NULL DEFAULT 0,
+          \`cost_cents\` INT NOT NULL DEFAULT 0,
+          \`error\` TEXT NULL
+        )`,
+      ];
+      for (const stmt of statements) {
+        try {
+          await (db as any).execute(sql.raw(stmt));
+          const tableName = stmt.match(/`(\w+)`/)?.[1];
+          results.push({ table: tableName, ok: true });
+        } catch (e: any) {
+          results.push({ stmt: stmt.slice(0, 60), error: String(e?.message ?? e) });
+        }
+      }
+      // Extend outreach_log (use try/catch per column since IF NOT EXISTS isn't universally supported on ADD COLUMN)
+      const alters = [
+        "ALTER TABLE `outreach_log` ADD COLUMN `template_id` VARCHAR(64) NULL",
+        "ALTER TABLE `outreach_log` ADD COLUMN `unsubscribe_token` VARCHAR(128) NULL",
+        "ALTER TABLE `outreach_log` ADD COLUMN `gmail_message_id` VARCHAR(255) NULL",
+        "ALTER TABLE `outreach_log` ADD COLUMN `subject` VARCHAR(500) NULL",
+        "CREATE INDEX `idx_outreach_unsub` ON `outreach_log`(`unsubscribe_token`)",
+      ];
+      for (const stmt of alters) {
+        try {
+          await (db as any).execute(sql.raw(stmt));
+          results.push({ alter: stmt.slice(0, 60), ok: true });
+        } catch (e: any) {
+          const msg = String(e?.message ?? e);
+          // Duplicate column/index errors are fine — migration is idempotent
+          const isDup = msg.includes("Duplicate") || msg.includes("exists");
+          results.push({ alter: stmt.slice(0, 60), ok: isDup, skipped: isDup, error: isDup ? undefined : msg });
+        }
+      }
+      return res.json({ success: true, results });
+    } catch (e: any) {
+      return res.status(500).json({ error: String(e?.message ?? e) });
+    }
+  });
+
+  // ═══════════════════════════════════════════════════════════════════════
   // Phase 2: Helper — admin auth via webhook secret
   // ═══════════════════════════════════════════════════════════════════════
   const requireAdmin = (req: any, res: any, next: () => void) => {
